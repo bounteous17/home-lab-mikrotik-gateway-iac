@@ -191,7 +191,7 @@ and OUI); the authoritative host inventory is in the [briefing repo](https://git
 
 | IP | Lease hostname | NIC vendor (OUI) | Role | Note |
 |---|---|---|---|---|
-| 192.168.11.50 | `panda` (**stale**) | Proxmox mini PC NIC (host is now static on .100) | Proxmox guest (see [home-lab-proxmox-ansible](https://github.com/bounteous17/home-lab-proxmox-ansible)) | Reservation is bound to the mini PC's NIC, but that host now uses static `.100`; `.50` is currently answered by a Proxmox guest MAC. Legacy first DNAT target. |
+| 192.168.11.50 | `panda` (**stale**) | Proxmox mini PC NIC (host is now static on .100) | Proxmox guest (see [home-lab-proxmox-ansible](https://github.com/bounteous17/home-lab-proxmox-ansible)) | Reservation is bound to the mini PC's NIC, but that host now uses static `.100`; `.50` is currently answered by a Proxmox guest MAC. |
 | 192.168.11.51 | `octopus` (**stale**) | Proxmox mini PC NIC (host is now static on .101) | Proxmox guest (see [home-lab-proxmox-ansible](https://github.com/bounteous17/home-lab-proxmox-ansible)) | Same situation: reservation bound to the mini PC's NIC, host now static `.101`; `.51` is answered by a Proxmox guest MAC. |
 | 192.168.11.150 | `lion` | Raspberry Pi | k3s agent (Raspberry Pi 4B) | Moved from `.100` on 2026-11-02 (collided with Proxmox node panda's static IP); now bound |
 | 192.168.11.151 | `eagle` | Raspberry Pi | k3s agent (Raspberry Pi 4B) | Moved from `.101` on 2026-11-02 (collided with Proxmox node octopus's static IP); now bound |
@@ -209,7 +209,7 @@ and OUI); the authoritative host inventory is in the [briefing repo](https://git
 | 192.168.11.49 | `home-lab-k3s-cluster-prod-shark` | k3s agent Pi (RPi OUI) |
 
 These are ordinary dynamic leases (10-minute lease time; they keep the same address only by renewal), so they are not
-pinned. Nginx Proxy Manager answers on `192.168.11.50` (target of NAT rules 10/11) with a static address on the
+pinned. Nginx Proxy Manager answers on `192.168.11.50` (target of NAT rules 2/3) with a static address on the
 Proxmox guest, not a DHCP lease.
 
 `bridge-people` (192.168.10.0/24) has no reservations and no active leases.
@@ -281,47 +281,16 @@ implicit default. Practical effects:
 
 ### Rule walkthrough (`/ip firewall nat`, in order)
 
+Live table after the 2026-11-02 cleanup (six rules):
+
 | # | Chain | Match | Action | Intent |
 |---|---|---|---|---|
-| 0 | dstnat | `in-interface=ether1` tcp/80 | dst-nat → 192.168.11.50:32248 | **LEGACY** (Traefik NodePort). `HTTP-panda`, first of four 80 → NodePort rules |
-| 1 | dstnat | `in-interface=ether1` tcp/80 | dst-nat → 192.168.11.51:32248 | **LEGACY** `HTTP-octopus` |
-| 2 | dstnat | `in-interface=ether1` tcp/80 | dst-nat → 192.168.11.100:32248 | **LEGACY** `HTTP-lion` (stale label) |
-| 3 | dstnat | `in-interface=ether1` tcp/80 | dst-nat → 192.168.11.101:32248 | **LEGACY** `HTTP-eagle` (stale label) |
-| 4–7 | dstnat | `in-interface=ether1` tcp/443 | dst-nat → .50 / .51 / .100 / .101 : **30445** | **LEGACY** `HTTPS-panda/octopus/lion/eagle` |
-| 8 | srcnat | src 192.168.11.0/24 → dst 192.168.11.0/24, out `bridge-home-lab` | masquerade | Hairpin NAT for the lab bridge |
-| 9 | srcnat | src 192.168.10.0/24 → dst 192.168.10.0/24, out `bridge-people` | masquerade | Hairpin NAT for the people bridge |
-| 10 | dstnat | `dst-address-list=wan-ip` tcp/80 | dst-nat → 192.168.11.50:80 | **Intended ingress** to NPM: WAN 80 (and hairpin for lab/VPN clients hitting the WAN address) |
-| 11 | dstnat | `dst-address-list=wan-ip`, `dst-address-type=unicast`, tcp/443 | dst-nat → 192.168.11.50:443 | **Intended ingress** to NPM: WAN 443 (and hairpin, same as above) |
-| 12 | srcnat | `out-interface=ether1` | masquerade | Normal outbound NAT for the lab, people net and VPN clients |
-| 13 | srcnat | dst 10.255.255.0/24, out `ether1` | masquerade | "WG NAT" – see note |
-| 14 | dstnat | tcp/8960 (any interface) | dst-nat → 192.168.11.50:30843 | **LEGACY** Jellyfin native-app forward, WAN:8960 → Jellyfin NodePort (HTTP). Not an intended exposure. |
-| 15 (disabled) | dstnat | tcp/8443 | dst-nat → 192.168.11.51:30843 | **LEGACY**, already disabled |
-
-### Intended ingress and legacy rules
-
-**Intended design (operator):** Nginx Proxy Manager on Proxmox (`192.168.11.50`) is the **only** ingress. WAN 80/443
-arrives via the ISP DMZ on `ether1` and is dst-NATed by **rules 10/11** to NPM, which terminates TLS for
-`<service>.begoodguys.ovh` and proxies to LXC/VM backends or k3s. NPM itself is out of scope here, see
-[`home-lab-proxmox-ansible`](https://github.com/bounteous17/home-lab-proxmox-ansible).
-
-**Legacy, to be removed:**
-
-- **Rules 0–7** (Traefik NodePort forwards: 80 → `32248`, 443 → `30445` on `.50`, `.51`, `.100`, `.101`).
-- **Rule 14** (WAN:8960 → Jellyfin NodePort `30843`) and disabled **rule 15**.
-- The four **netwatch** monitors (`panda .50`, `octopus .51`, `lion .100`, `eagle .101`; 10 s interval, 3 s timeout). They
-  only exist to disable/enable these NAT rules by comment match (`find comment~"<name>"`), a crude failover order
-  `panda → octopus → lion → eagle`.
-
-**Known issue (ordering):** the legacy rules 0–7 match any packet entering `ether1` on 80/443, and they sit **before**
-rules 10/11. Today all four nodes are up, so the rules are enabled and **would match WAN traffic first**, sending it to the
-NodePorts instead of NPM. Their counters are 0 packets since the last reboot (about 1.7 days), while rules 10/11 have
-counted traffic (so far only lab/VPN clients), so this has not been observed in practice. It should be fixed by deleting
-the legacy rules, not by reordering.
-
-Naming history: "lion"/"eagle" were the Raspberry Pi k3s agents that once held `.100`/`.101`; those IPs now belong to the
-Proxmox nodes `panda`/`octopus` (static) and the Pis moved to `.150`/`.151`, so the lion/eagle rules and netwatch entries
-(still on `.100`/`.101`) now point at the Proxmox nodes. Rules 10/11 still carry "traefik" in their
-comments although they point at NPM.
+| 0 | srcnat | src 192.168.11.0/24 → dst 192.168.11.0/24, out `bridge-home-lab` | masquerade | Hairpin NAT for the lab bridge |
+| 1 | srcnat | src 192.168.10.0/24 → dst 192.168.10.0/24, out `bridge-people` | masquerade | Hairpin NAT for the people bridge |
+| 2 | dstnat | `dst-address-list=wan-ip` tcp/80 | dst-nat → 192.168.11.50:80 | **Ingress** to NPM: WAN 80 (and hairpin for lab/VPN clients hitting the WAN address) |
+| 3 | dstnat | `dst-address-list=wan-ip`, `dst-address-type=unicast`, tcp/443 | dst-nat → 192.168.11.50:443 | **Ingress** to NPM: WAN 443 (and hairpin, same as above) |
+| 4 | srcnat | `out-interface=ether1` | masquerade | Normal outbound NAT for the lab, people net and VPN clients |
+| 5 | srcnat | dst 10.255.255.0/24, out `ether1` | masquerade | "WG NAT" – see note |
 
 ### How hairpin NAT is implemented, and why it is needed
 
@@ -336,10 +305,10 @@ WAN address (the public IP, or the router's own `192.168.1.50`) and try to conne
 
 How this router solves it:
 
-- **dst-NAT on "own WAN address" (rules 10/11):** `dst-address-list=wan-ip` contains both the DDNS-resolved public IP
-  and `192.168.1.50`. Any connection to either address on 80/443 that is **not** matched by the earlier `in-interface=ether1`
-  rules (i.e. from `bridge-home-lab`, `bridge-people` or the VPN) is redirected to `192.168.11.50:80/443`.
-- **Source masquerade on the same bridge (rules 8/9):** when client and backend are in the same subnet, the srcnat
+- **dst-NAT on "own WAN address" (rules 2/3):** `dst-address-list=wan-ip` contains both the DDNS-resolved public IP
+  and `192.168.1.50`. Any connection to either address on 80/443, whatever the ingress interface (`ether1`, `bridge-home-lab`,
+  `bridge-people` or the VPN), is redirected to `192.168.11.50:80/443`.
+- **Source masquerade on the same bridge (rules 0/1):** when client and backend are in the same subnet, the srcnat
   masquerade (src = dst subnet, out-interface = that bridge) rewrites the source to the router's address so the
   backend answers **back through the router**, where the reverse NAT happens. Pure L2 traffic is not affected
   (the bridge does not pass bridged frames through the IP firewall), only traffic that has been routed/dst-NATed.
@@ -350,11 +319,10 @@ How this router solves it:
 
 Notes on specific rules:
 
-- Rules 0–7 match on `in-interface=ether1` only (not on destination), so **any** host on the ISP LAN reaching
-  `192.168.1.50:80/443` is forwarded the same way as Internet traffic. Rules 10/11 therefore apply to traffic that did **not**
-  enter on `ether1` – bridges and WireGuard.
-- Rule 13 ("WG NAT": `dst-address=10.255.255.0/24`, `out-interface=ether1`) does not appear to match any real flow: traffic
-  to VPN clients leaves via `wg1`, not `ether1`. Outbound traffic from VPN clients is already covered by rule 12.
+- Rules 2/3 have no `in-interface` or source match, so **any** host on the ISP LAN reaching `192.168.1.50:80/443` is
+  forwarded to NPM the same way as Internet traffic (see [section 7](#is-80443-reachable-from-the-internet)).
+- Rule 5 ("WG NAT": `dst-address=10.255.255.0/24`, `out-interface=ether1`) does not appear to match any real flow: traffic
+  to VPN clients leaves via `wg1`, not `ether1`. Outbound traffic from VPN clients is already covered by rule 4.
 
 ## 7. WireGuard
 
@@ -380,7 +348,7 @@ How VPN clients reach the lab:
 2. The client gets a /32 inside 10.255.255.0/24; routes to 192.168.10.0/24, 192.168.11.0/24 (and optionally everything)
    are chosen in the **client** config, not on the router.
 3. `forward` rule 4 accepts everything coming from `wg1`, so a client can reach `bridge-home-lab`, `bridge-people`
-   and the Internet (masqueraded by rule 12). There is **no per-peer restriction**: every peer has the same "full access".
+   and the Internet (masqueraded by rule 4). There is **no per-peer restriction**: every peer has the same "full access".
 4. DNS: peers use Cloudflare, not the router, so catalog hostnames (`*.begoodguys.ovh`) must resolve publicly
    to an address the VPN can route (see the [briefing repo](https://github.com/bounteous17/home-lab-briefing)).
    NPM (on Proxmox) then terminates TLS and proxies to the LXC/VM backends.
@@ -403,7 +371,7 @@ VPN clients that resolve the public IP still reach NPM.
 
 | Check | Finding |
 |---|---|
-| `src-address` / `src-address-list` on the dst-NAT rules (0–7, 10, 11, 14) | **None.** Rules 10/11 match only `dst-address-list=wan-ip`; rules 0–7 only `in-interface=ether1`; rule 14 matches anything. |
+| `src-address` / `src-address-list` on the dst-NAT rules (2, 3) | **None.** They match only `dst-address-list=wan-ip` (the router's own addresses). |
 | `forward` drop / "allow only lab and VPN" rule | **None.** The forward chain has no drop; it has FastTrack, established/related accept and "accept from `wg1`". |
 | `input` drop | **None**, so the router's own services are not firewalled either. |
 | Address list restricting sources | The only list, `wan-ip`, holds the router's *own* addresses (destination match), not allowed clients. |
@@ -482,11 +450,11 @@ home-lab/MikroTik hardening guidance.
 
 | # | Observation | Why it matters | Suggested direction |
 |---|---|---|---|
-| 1 | **HIGH: catalog exposure is not enforced by the router.** Intended policy is LAN + WireGuard only, but the 80/443 dst-NATs have no source restriction and there are no drop rules; enforcement depends solely on NPM (out of scope, [`home-lab-proxmox-ansible`](https://github.com/bounteous17/home-lab-proxmox-ansible)). | The ISP-DMZ makes 80/443 (and anything else) reachable from the Internet and the ISP LAN. A mistake in NPM exposes the catalog. | Add `src-address-list` (lab, VPN) to rules 10/11 and/or drop new dst-NATed connections from `ether1` except from allowed sources; use `connection-nat-state=dstnat` in `forward`. |
+| 1 | **HIGH: catalog exposure is not enforced by the router.** Intended policy is LAN + WireGuard only, but the 80/443 dst-NATs have no source restriction and there are no drop rules; enforcement depends solely on NPM (out of scope, [`home-lab-proxmox-ansible`](https://github.com/bounteous17/home-lab-proxmox-ansible)). | The ISP-DMZ makes 80/443 (and anything else) reachable from the Internet and the ISP LAN. A mistake in NPM exposes the catalog. | Add `src-address-list` (lab, VPN) to rules 2/3 and/or drop new dst-NATed connections from `ether1` except from allowed sources; use `connection-nat-state=dstnat` in `forward`. |
 | 2 | **HIGH: no default-drop in `input`.** Only a WireGuard accept exists. | Router services reachable from `ether1` are effectively on the Internet; SSH/Winbox/web are limited only by `available-from`, and DNS, `btest` and MAC services are unrestricted. | Standard input chain: accept established/related, drop invalid, accept WG, accept management from the lab/VPN/ISP-LAN lists, **drop the rest**. |
 | 3 | **Open DNS resolver** (`allow-remote-requests=yes`, no input filtering). | Reachable via the DMZ; abusable for amplification. | Restrict udp/tcp 53 in `input` to the bridges and `wg1`. |
 | 4 | **No forward drop / no segregation** between `ether1`, `bridge-people`, `bridge-home-lab`, `wg1`. | A device on the people network can reach the lab; any VPN peer can reach everything. | `LAN`/`WAN` interface lists, drop invalid, drop `WAN`→LAN that is not dst-NATed, block `bridge-people` → `bridge-home-lab`. |
-| 5 | **Legacy NAT/netwatch/DNS cleanup:** NodePort rules 0–7, Jellyfin rules 14/15, four netwatch monitors, stale `lion`/`eagle` labels and "traefik" comments, deprecated `jellyfin.home-lab.begoodguys.ovh` static DNS entry. Rules 0–7 precede rules 10/11 and would match WAN traffic first. | WAN 80/443 can bypass NPM; confusing labels; netwatch is fragile (comment substring matching). | Remove them (not reorder); keep only rules 10/11 (+ hairpin masquerade). 8960 is not an intended exposure. |
+| 5 | **Remaining legacy cleanup:** four netwatch monitors (now no-ops after the 2026-11-02 NAT cleanup), "traefik" comments on rules 2/3, deprecated `jellyfin.home-lab.begoodguys.ovh` static DNS entry. | Dead config and misleading labels; netwatch entries still ping hosts for nothing. | Remove them. |
 | 6 | **Management `available-from` mismatches.** Winbox allows `192.168.0.0/24` (likely typo for `192.168.1.0/24`); SSH/WebFig do not allow the ISP LAN; `btest` and `reverse-proxy` are open. | Management over the ISP LAN does not work as intended; unnecessary open services. | Define a `MGMT` list (WireGuard + ISP LAN), apply it to services and `input`; disable `btest` and MAC-server on `ether1`. |
 | 7 | **Static IPs inside the DHCP pool** (`.100/.101` vs `.2–.254`) and 10-minute leases. | Caused the lion/eagle collision; dynamic hosts (k3s control-plane/agents) drift. | Shrink pools (e.g. `.200–.254`), reserve long-lived hosts, raise the lease time. |
 | 8 | **Stale panda/octopus reservations.** `.50`/`.51` are bound to the mini PCs' NICs, but those nodes are now static on `.100`/`.101`; `.50/.51` are answered by Proxmox guests. | Reservations point at hosts that no longer use them and can hand `.50/.51` to the wrong device. | Clean up the stale `panda`/`octopus` reservations; make the `.100/.101` reservations match the Proxmox nodes (or keep them static, outside the pool). |
@@ -497,7 +465,7 @@ home-lab/MikroTik hardening guidance.
 | 13 | **FastTrack without a surrounding ruleset.** | Nothing protects the forward path. | Keep FastTrack, after the `invalid` drop. |
 | 14 | **DNS handled outside the router.** Clients and VPN peers use 1.1.1.1; the single split-horizon entry is never used by them. | Overrides only help clients that query the router. | Hand out the router (or an internal resolver) and add overrides there. |
 | 15 | **Leftover config:** broken `CronDisable/EnableWLAN`, disabled `wlan1` still bridged, unused `wifi` security profile, disabled DNS entry, old cert/RIF files, `ether10` unbridged. | Noise for future IaC. | Remove or document before codifying. |
-| 16 | **Rule 13 ("WG NAT") likely ineffective.** | See [section 6](#6-nat-and-hairpin-nat). | Drop it or confirm its purpose. |
+| 16 | **Rule 5 ("WG NAT") likely ineffective.** | See [section 6](#6-nat-and-hairpin-nat). | Drop it or confirm its purpose. |
 | 17 | **Lab uplinks at 100 Mbps** (`ether6/7/8`). | The RB2011's `ether6–10` are Fast Ethernet; `ether3–5` are free gigabit. | Move uplinks to `ether3`–`ether5`. |
 | 18 | **Discovery protocols and MAC server on `ether1`.** | Leaks router identity to the ISP LAN. | Restrict to a LAN list. |
 | 19 | **Single point of failure:** one router, one uplink, no failover. | Router loss takes the lab and VPN down. | Keep a recent off-box backup and a documented recovery path. |
@@ -507,7 +475,7 @@ home-lab/MikroTik hardening guidance.
 Planned, **not done**:
 
 1. **Firewall hardening:** default-drop `input` and `forward`; close the open DNS resolver; isolate `bridge-people` from
-   `bridge-home-lab`; restrict the 80/443 dst-NATs to allowed sources (lab + WireGuard); remove the legacy NAT/netwatch rules.
+   `bridge-home-lab`; restrict the 80/443 dst-NATs to allowed sources (lab + WireGuard); remove the remaining legacy netwatch monitors and the deprecated Jellyfin DNS entry.
 2. **Uplinks:** move the lab uplinks from 100 Mbps `ether6`–`ether8` to gigabit `ether3`–`ether5`.
 3. **Off-box config backups:** scheduled, sanitized export.
 
