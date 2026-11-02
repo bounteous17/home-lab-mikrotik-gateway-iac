@@ -288,7 +288,7 @@ Live table after the 2026-11-02 cleanup (six rules):
 | 0 | srcnat | src 192.168.11.0/24 → dst 192.168.11.0/24, out `bridge-home-lab` | masquerade | Hairpin NAT for the lab bridge |
 | 1 | srcnat | src 192.168.10.0/24 → dst 192.168.10.0/24, out `bridge-people` | masquerade | Hairpin NAT for the people bridge |
 | 2 | dstnat | `dst-address-list=wan-ip` tcp/80 | dst-nat → 192.168.11.50:80 | **Ingress** to NPM: WAN 80 (and hairpin for lab/VPN clients hitting the WAN address) |
-| 3 | dstnat | `dst-address-list=wan-ip`, `dst-address-type=unicast`, tcp/443 | dst-nat → 192.168.11.50:443 | **Ingress** to NPM: WAN 443 (and hairpin, same as above) |
+| 3 | dstnat | `dst-address-list=wan-ip`, tcp/443 | dst-nat → 192.168.11.50:443 | **Ingress** to NPM: WAN 443 (and hairpin, same as above) |
 | 4 | srcnat | `out-interface=ether1` | masquerade | Normal outbound NAT for the lab, people net and VPN clients |
 | 5 | srcnat | dst 10.255.255.0/24, out `ether1` | masquerade | "WG NAT" – see note |
 
@@ -358,7 +358,7 @@ see the next section.
 
 ### Is 80/443 reachable from the Internet?
 
-**Yes, at the router level it is, and no router rule restricts who can use it.**
+**Yes. Since 2026-11-02 it is verified reachable from the Internet, and no router rule restricts who can use it.**
 
 Context: public DNS for `*.begoodguys.ovh` at OVH points to the MikroTik's `/ip cloud` DDNS name, i.e. to the ISP fibre
 public IP (neither is published here). The ISP router's DMZ forwards all inbound traffic to `192.168.1.50`, where the
@@ -382,31 +382,41 @@ Enforcement therefore depends **entirely on NPM** (access lists on its proxy hos
 router. Any host that sends TCP 80/443 to the public IP, or to `192.168.1.50` from the ISP LAN, is delivered to the next hop;
 what it gets depends on NPM. This is tracked as the top item in [section 9](#9-known-issues-and-recommended-improvements).
 
-Not verified: end-to-end reachability from the Internet was not tested (no external probing), and NPM's access-list
-behaviour was not inspected.
+**Verified 2026-11-02 (external probing):** TCP 80 and 443 on the public IP are reachable from the Internet, so with the
+DMZ strategy **all catalog services published through NPM are public**, e.g. `https://vaultwarden.begoodguys.ovh/`
+returns the Vaultwarden login page from outside. NPM's access-list behaviour was not inspected.
+
+**Incident fixed the same day (443 not reachable from outside).** NAT rule 3 carried `dst-address-type=unicast`.
+Internet traffic arrives through the DMZ with destination `192.168.1.50`, which is the router's own `ether1` address
+(address type `local`), so rule 3 never matched it; the packet was handled as traffic for the router and refused. Port 80
+(rule 2, no address-type match) worked. Hairpin traffic from the lab matched rule 3 only because it targets the public IP,
+which is not a local address, so the fault was invisible from inside. Fix: `dst-address-type` removed from rule 3, and the
+`reverse-proxy` service on 443 disabled. Diagnosis tip: probe from outside the network (a test from the lab goes through the
+hairpin path) and compare the NAT rule counters before and after.
 
 ## 8. Management plane
 
 ### Management access
 
-The operator manages the router over **WireGuard (10.255.255.0/24)** and from the **ISP LAN (192.168.1.0/24)**. The service
-lists do not match that: SSH allows `10.255.255.0/24` (OK) but not the ISP LAN; WebFig allows only `192.168.10.0/24`; Winbox
-allows `192.168.0.0/24`, most likely a typo for `192.168.1.0/24`. As configured, Winbox does **not** work from the ISP LAN.
-No firewall rule backs these lists (see [section 5](#5-firewall-filter)).
+The operator manages the router over **WireGuard (10.255.255.0/24)** and from the **home-lab bridge (192.168.11.0/24)**.
+SSH and Winbox allow exactly those two networks (corrected 2026-11-02; previously Winbox allowed `192.168.0.0/24`, a typo,
+and SSH allowed `192.168.10.0/24`). The **ISP LAN (192.168.1.0/24) and `bridge-people` (192.168.10.0/24) are not allowed**,
+so management from them is refused. WebFig (`www-ssl`) is disabled. No firewall rule backs these lists (see
+[section 5](#5-firewall-filter)); they are the only protection of the services.
 
 ### IP services
 
 | Service | Port | State | Allowed from |
 |---|---|---|---|
-| ssh | 22 | enabled | 192.168.10.0/24, 10.255.255.0/24 |
-| winbox | 8291 | enabled | 192.168.0.0/24 (**likely a typo for 192.168.1.0/24**, the ISP LAN; no such network is attached) |
-| www-ssl | 443 | enabled (TLS 1.2 only, `webfig` certificate) | 192.168.10.0/24 |
+| ssh | 22 | enabled (host key type `ed25519`) | 192.168.11.0/24, 10.255.255.0/24 |
+| winbox | 8291 | enabled | 192.168.11.0/24, 10.255.255.0/24 |
+| www-ssl | 443 | disabled (TLS 1.2 only, `webfig` certificate; list is `192.168.10.0/24` if re-enabled) | – |
 | www | 8080 | disabled | – |
 | ftp | 21 | disabled | – |
 | telnet | 23 | disabled | – |
 | api / api-ssl | 8728 / 8729 | disabled | – |
 | `btest` (bandwidth test) | 2000 | enabled (system default) | any |
-| `reverse-proxy` (443 service, no cert) | 443 | listed, `available-from` unset | any |
+| `reverse-proxy` (443 service, no cert) | 443 | disabled 2026-11-02 | – |
 
 Other management surface: MAC-telnet/MAC-winbox on all interfaces, neighbor discovery (CDP/LLDP/MNDP) on static
 interfaces including `ether1`, SNMP off, UPnP off, web proxy off, SOCKS off.
@@ -455,7 +465,7 @@ home-lab/MikroTik hardening guidance.
 | 3 | **Open DNS resolver** (`allow-remote-requests=yes`, no input filtering). | Reachable via the DMZ; abusable for amplification. | Restrict udp/tcp 53 in `input` to the bridges and `wg1`. |
 | 4 | **No forward drop / no segregation** between `ether1`, `bridge-people`, `bridge-home-lab`, `wg1`. | A device on the people network can reach the lab; any VPN peer can reach everything. | `LAN`/`WAN` interface lists, drop invalid, drop `WAN`→LAN that is not dst-NATed, block `bridge-people` → `bridge-home-lab`. |
 | 5 | **Remaining legacy cleanup:** four netwatch monitors (now no-ops after the 2026-11-02 NAT cleanup), "traefik" comments on rules 2/3, deprecated `jellyfin.home-lab.begoodguys.ovh` static DNS entry. | Dead config and misleading labels; netwatch entries still ping hosts for nothing. | Remove them. |
-| 6 | **Management `available-from` mismatches.** Winbox allows `192.168.0.0/24` (likely typo for `192.168.1.0/24`); SSH/WebFig do not allow the ISP LAN; `btest` and `reverse-proxy` are open. | Management over the ISP LAN does not work as intended; unnecessary open services. | Define a `MGMT` list (WireGuard + ISP LAN), apply it to services and `input`; disable `btest` and MAC-server on `ether1`. |
+| 6 | **Management `available-from` (fixed 2026-11-02, residual items).** SSH and Winbox now allow only `192.168.11.0/24` and `10.255.255.0/24`; WebFig is disabled. Still open: `btest` (any source), MAC-server/MAC-winbox on all interfaces, CDP/LLDP/MNDP on `ether1`. The lists are not backed by the firewall. | Management is refused from the ISP LAN and `bridge-people`, which is stricter than the earlier intent, but the open `btest`/MAC services are still reachable from `ether1`. | Add a `MGMT` list in `input` and drop the rest (see 2); disable `btest` and restrict MAC-server and discovery to the lab bridge. |
 | 7 | **Static IPs inside the DHCP pool** (`.100/.101` vs `.2–.254`) and 10-minute leases. | Caused the lion/eagle collision; dynamic hosts (k3s control-plane/agents) drift. | Shrink pools (e.g. `.200–.254`), reserve long-lived hosts, raise the lease time. |
 | 8 | **Stale panda/octopus reservations.** `.50`/`.51` are bound to the mini PCs' NICs, but those nodes are now static on `.100`/`.101`; `.50/.51` are answered by Proxmox guests. | Reservations point at hosts that no longer use them and can hand `.50/.51` to the wrong device. | Clean up the stale `panda`/`octopus` reservations; make the `.100/.101` reservations match the Proxmox nodes (or keep them static, outside the pool). |
 | 9 | **Firmware 3.33 vs 7.24.4 available.** | RouterBOOT is far behind RouterOS. | Upgrade firmware (then reboot) in a maintenance window. |
